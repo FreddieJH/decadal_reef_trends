@@ -1,0 +1,358 @@
+---
+title: "Main analysis"
+author: "Freddie  J. Heather"
+date: "01/08/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+# Species population trends
+
+## Reading in raw data
+
+```{r}
+data_raw <- 
+  read_csv("data/input_data.csv") %>% 
+  pivot_longer(cols = `1992`:`2020`,
+               names_to = "year",
+               values_to = "count")
+
+# Biogeography for each species
+spp_traits <- 
+  read_csv("data/spp_traits.csv") %>% 
+  select(species_name_update = SPECIES_NAME,
+         Biogeog = Biogeog2)
+
+# All species 
+included_spp <- 
+  spp_traits %>% 
+  pull(species_name_update) %>%
+  unique()
+
+# State for each site code
+state_tab <- 
+  read_csv("data/states_tab.csv") %>% 
+  select(site_code, 
+         State_new = State)
+
+```
+
+## Filling in gaps
+
+
+```{r}
+
+# Interpolation
+data_interp <-
+  data_raw %>% 
+  group_by(site_code, species_name_update) %>% 
+  mutate(count_interp = zoo::na.approx(count, na.rm = F)) %>% 
+  mutate(latitude = round(latitude),
+         longitude = round(longitude))
+
+# Extrapolation
+data_clean <- 
+  data_interp %>%
+  group_by(site_code, species_name_update) %>%
+  mutate(count_extrap = count_interp) %>%
+  fill(count_extrap, .direction = "downup") %>%
+  ungroup()
+
+```
+
+## Mean counts per lat-lon grid cell
+
+```{r}
+
+# Mean within grid cells
+data_latlon_means <- 
+  data_clean %>% 
+  group_by(latitude, longitude, MPA, Taxon, species_name_update, year, State) %>% 
+  summarise(mean_count_latlon = mean(count_extrap, na.rm = T), 
+            .groups = "drop")
+
+# species mean of within that grid cell
+data_latlon_means_perspp <- 
+  data_latlon_means %>% 
+  group_by(Taxon, species_name_update, year) %>% 
+  summarise(mean_count_latlon_perspp = mean(mean_count_latlon, na.rm = T), 
+            .groups = "drop")
+
+```
+
+## Logging mean count values
+
+```{r}
+
+# min value to be used when mean count is zero 
+min_vals <- 
+  data_latlon_means_perspp %>% 
+  filter(year >= 2008) %>% 
+  group_by(species_name_update) %>% 
+  summarise(min_latlon_perspp = min(mean_count_latlon_perspp[mean_count_latlon_perspp != 0], na.rm = T),
+            .groups = "drop") 
+
+# log transform, use (min count for the species)/2 when no mean count is available
+data_latlon_means_perspp_log <- 
+  data_latlon_means_perspp %>% 
+  filter(year >= 2008) %>%
+  left_join(min_vals, by = "species_name_update") %>%
+  mutate(log_mean_count_latlon_perspp = case_when(mean_count_latlon_perspp == 0 ~ log(min_latlon_perspp/2), 
+                                    TRUE            ~ log(mean_count_latlon_perspp))) 
+
+```
+
+## Slope values of population trends
+
+```{r}
+
+# get the slope of the last 2008-2020 data
+latlon_means_perspp_slopes <-
+  data_latlon_means_perspp_log %>% 
+  filter(log_mean_count_latlon_perspp != Inf) %>% 
+  group_by(species_name_update) %>% 
+  nest() %>% 
+  mutate(lm =  map(data, ~lm(.x$log_mean_count_latlon_perspp ~ as.numeric(.x$year))),
+         slope = map_dbl(lm, ~.x$coefficients[2]), 
+         r2 = map_dbl(lm, ~summary(.x)$r.squared),
+         adj_r2 = map_dbl(lm, ~summary(.x)$adj.r.squared)) %>% 
+  select(-c(data, lm, r2, adj_r2))
+
+
+# 2008-10 vs 2018-2020 mean counts
+latlon_means_perspp_changeratio <-
+  data_latlon_means_perspp_log %>% 
+  mutate(decade = case_when(year %in% 2008:2010 ~ "first",
+                            year %in% 2018:2020 ~ "second",
+                            TRUE ~ NA_character_)) %>% 
+  group_by(species_name_update, decade) %>%
+  summarise(decade_mean = mean(mean_count_latlon_perspp, na.rm = T)) %>% 
+  filter(!is.na(decade)) %>% 
+  pivot_wider(names_from = decade,
+              values_from = decade_mean) %>% 
+  mutate(change_ratio = second/first) %>% 
+  select(-c(second, first))
+
+# Number of counts per species
+count_spp <-
+  data_clean %>% 
+  filter(count > 0) %>% 
+  group_by(species_name_update) %>% 
+  summarise(total_count = n())
+
+output_poptrend <-
+  full_join(latlon_means_perspp_slopes, latlon_means_perspp_changeratio) %>% 
+  left_join(count_spp) %>% 
+  arrange(species_name_update) %>% 
+  mutate_if(is.numeric, list(~na_if(., Inf))) %>% 
+  mutate_if(is.numeric, list(~na_if(., -Inf)))
+
+write_csv(output_poptrend, "output/spp_poptrend.csv")
+
+```
+
+# Analysis 2
+
+## Logging raw count values
+
+```{r}
+
+# min values of the original counts to be used to log zero
+min_vals_raw <- 
+  data_clean %>% 
+  group_by(species_name_update, site_code) %>% 
+  summarise(min = min(count[count != 0], na.rm = T),
+            .groups = "drop") 
+
+# log of count within cells
+data_logcount <- 
+  data_clean %>% 
+  select(species_name_update, year, count, site_code, latitude, longitude, MPA) %>% 
+  left_join(min_vals_raw) %>%
+  mutate(log_count = case_when(count == 0 ~ log(min/2), 
+                               TRUE       ~ log(count))) 
+```
+
+## Standardisation
+
+Log counts are standardised to the mean value for the given site and species.
+
+```{r}
+
+# mean logcount - to be used as difference from raw count within spp within cells
+data_logcount_mean <-
+  data_logcount %>% 
+  group_by(species_name_update, site_code, latitude, longitude) %>% 
+  summarise(mean_logcount = mean(log_count, na.rm = T))
+
+# logcount minus mean(log count) within spp within cells
+data_logcounts_std <- 
+  data_logcount %>% 
+  left_join(data_logcount_mean) %>% 
+  mutate(std_logcount = log_count - mean_logcount) %>% 
+  group_by(latitude, longitude, MPA, species_name_update, year) %>% 
+  summarise(mean_std_logcount = mean(std_logcount, na.rm = T), 
+            .groups = "drop") %>% 
+  mutate(mean_std_logcount = ifelse(is.nan(mean_std_logcount), NA, mean_std_logcount))
+
+# mean of standardised log counts per species per year
+data_logcounts_std_sppyear <- 
+  data_logcounts_std %>% 
+  group_by(species_name_update, year) %>% 
+  summarise(mean_std_logcount_sppyear = mean(mean_std_logcount, na.rm = T), 
+            .groups = "drop") %>%   
+  mutate(mean_std_logcount_sppyear = ifelse(is.nan(mean_std_logcount_sppyear), NA, mean_std_logcount_sppyear)) %>% 
+  filter(year >= 2008) # only looking at post-2007 data
+
+```
+
+
+```{r}
+
+# Spearmans rank of the standardised log counts
+output_spearmans <- 
+  data_logcounts_std_sppyear %>% 
+  group_by(species_name_update) %>%
+  na.omit() %>% 
+  nest() %>% 
+  mutate(n_row = map_dbl(data, ~nrow(.x))) %>% 
+  filter(n_row > 5) %>% 
+  mutate(rho = map_dbl(data, ~cor(as.numeric(.x$year), .x$mean_std_logcount_sppyear, method = "spearman")),
+         pval = map_dbl(data, ~cor.test(as.numeric(.x$year), .x$mean_std_logcount_sppyear, method = "spearman")$p.val)#,
+         #pval = map_dbl(data, ~cor.test(as.numeric(.x$year), rank(.x$mean_std_logcount2))$p.val)
+  ) %>% 
+  mutate(sig = case_when(pval <= 0.001 ~ "***",
+                         pval <= 0.01  ~ "**",
+                         pval <= 0.05  ~ "*",
+                         TRUE ~ "")) %>% 
+  mutate(direction = case_when(sig != "" & rho > 0 ~ "up",
+                               sig != "" & rho < 0 ~ "down",
+                               TRUE ~ "")) %>% 
+  select(-data)
+
+write_csv(output_spearmans, "output/output_spearmans.csv")
+
+```
+
+# Plotting
+
+## Data for plotting
+
+
+```{r}
+
+# minimum values including interpolated/extrapolated values
+# Note: this could be less than zero if interpolated between 0 and 1.
+min_vals_interp <- 
+  data_clean %>% 
+  group_by(species_name_update, site_code) %>% 
+  summarise(min = min(count_extrap[count_extrap != 0], na.rm = T),
+            .groups = "drop")
+
+# replace zero values by min/2 before logging
+data_log_interp <- 
+  data_clean %>% 
+  left_join(min_vals_interp) %>% 
+  mutate(log_extrap = case_when(count_extrap == 0 ~ log(min/2),
+                                TRUE ~ log(count_extrap)))
+
+# log value for 2008 for standardisation
+val_2008 <- 
+  data_log_interp %>% 
+  select(site_code, species_name_update, year, log_extrap) %>% 
+  filter(year == 2008) %>% 
+  distinct() %>% 
+  rename(log_extrap_2008 = log_extrap) %>% 
+  select(-year)
+
+# Log count - 2008 log count (difference of logs)
+data_log_interp_std <- 
+  data_log_interp %>% 
+  left_join(val_2008) %>% 
+  mutate(log_extrap_std = log_extrap - log_extrap_2008)
+
+```
+## Mean standardised log of extrapolated counts
+
+```{r}
+
+# adding biogeog and State information
+data_log_interp_std_step1 <- 
+  data_log_interp_std %>% 
+  left_join(spp_traits) %>% 
+  filter(species_name_update %in% included_spp) %>% 
+  select(-State) %>% 
+  left_join(state_tab) 
+
+# post 2007 means
+data_log_interp_std_means <- 
+  data_log_interp_std_step1 %>% 
+  filter(year >= 2008) %>% 
+  group_by(Taxon, State_new, Biogeog, species_name_update, year) %>% 
+  summarise(mean_log_extrap_std = mean(log_extrap_std, na.rm = T), .groups = "drop")
+
+
+```
+
+## P1 = Biogeog trends per State
+
+```{r}
+
+p1_data <-
+  data_log_interp_std_means %>% 
+  group_by(State_new, Biogeog, year) %>% 
+  summarise(mean_log_extrap = 
+              mean(mean_log_extrap_std, na.rm = T), .groups = "drop")
+
+write_csv(p1_data, "output/p1_data.csv")
+```
+
+## P2 = Taxon trends by State
+
+```{r}
+
+p2_data <-
+  data_log_interp_std_means %>% 
+  group_by(State_new, Taxon, year) %>% 
+  summarise(mean_log_extrap = mean(mean_log_extrap_std, na.rm = T), 
+            .groups = "drop")
+
+write_csv(p2_data, "output/p2_data.csv")
+```
+
+## P3 = Biogeog trends by 5 degs lat
+
+```{r}
+
+lats <- 
+  data_clean %>% 
+  select(site_code, latitude, longitude) %>% 
+  distinct()
+
+lat_bins <- 
+  tibble(lat_bins = seq(-45, 0, by = 5)) %>% 
+  mutate(bin_num = 1:length(lat_bins))
+
+lat_5degs <- 
+  data_clean %>% 
+  select(site_code, latitude, longitude) %>% 
+  distinct() %>% 
+  mutate(lat_bin = lat_bins$lat_bins[.bincode(latitude + 5, lat_bins$lat_bins)])
+
+p3_data <-
+  data_log_interp_std_step1 %>% 
+  left_join(lat_5degs) %>% 
+  group_by(lat_bin, Biogeog, Taxon, species_name_update, year ) %>% 
+  filter(year  >= 2008) %>% 
+  summarise(mean_val = mean(log_extrap_std, na.rm = T)) %>% 
+  group_by(lat_bin, Biogeog, year) %>% 
+  summarise(mean = mean(mean_val, na.rm = T))
+
+write_csv(p3_data, "output/p3_data.csv")
+
+```
+
